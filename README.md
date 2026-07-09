@@ -83,7 +83,7 @@ After login — platform, region, workers, CPU/RAM:
 
 Select what to deploy. Each card describes what the script does.
 
-![Components — select Loki, users, ACM, GPU](application/docs/images/04-components.png)
+![Components — Loki, per-user alerting, users, ACM, GPU, and Developer view options](application/docs/images/04-components.png)
 
 **Order:** Loki → Users → ACM → GPU
 
