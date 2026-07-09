@@ -10,6 +10,17 @@ from pathlib import Path
 
 from app.config import REPO_ROOT, ROOT_DIR, SCRIPT_MAP
 from app.services import cluster
+from app.services.preflight import run_preflight
+
+# Max seconds per script (wizard will fail the step after this).
+SCRIPT_TIMEOUT_SEC: dict[str, int] = {
+    "loki-install-aws-gcp-loki-script": 3600,
+    "setup-users+redadmin.sh": 1800,
+    "setup_users+loki_alerting.sh": 3600,
+    "acm_acmobserve_aws_gcp.sh": 5400,
+    "provision-gpu-and-metrics.sh": 3600,
+}
+DEFAULT_SCRIPT_TIMEOUT_SEC = 3600
 
 
 @dataclass
@@ -38,11 +49,11 @@ def build_execution_plan(selected: dict[str, bool]) -> list[tuple[str, Path]]:
     if selected.get("loki"):
         plan.append(("Deploy Loki logging stack", SCRIPT_MAP["loki"]))
 
+    if selected.get("loki_alerting"):
+        plan.append(("Deploy per-user Loki log alerting", SCRIPT_MAP["users_loki"]))
+
     if selected.get("users"):
-        if selected.get("loki"):
-            plan.append(("Deploy users + Loki alerting demo", SCRIPT_MAP["users_loki"]))
-        else:
-            plan.append(("Deploy HTPasswd users (aaa–zzz)", SCRIPT_MAP["users_basic"]))
+        plan.append(("Deploy HTPasswd users (aaa–zzz + redadmin)", SCRIPT_MAP["users_basic"]))
 
     if selected.get("acm"):
         plan.append(("Deploy ACM + Observability", SCRIPT_MAP["acm"]))
@@ -122,7 +133,7 @@ def scale_workers(extra_count: int) -> dict:
     }
 
 
-def _run_script(job: JobState, label: str, script_path: Path, kerberos: str) -> bool:
+def _run_script(job: JobState, label: str, script_path: Path, kerberos: str, developer_view: bool) -> bool:
     job.current_step = label
     _append_log(job, f"\n{'=' * 60}\n▶ {label}\n   Script: {script_path.name}\n{'=' * 60}\n")
     _append_log(job, f"S3/GCS bucket key (kerberos): {kerberos}")
@@ -136,7 +147,9 @@ def _run_script(job: JobState, label: str, script_path: Path, kerberos: str) -> 
         **os.environ,
         "OCP_TOOLKIT_AUTO_YES": "1",
         "OCP_TOOLKIT_KERBEROS": kerberos,
+        "OCP_TOOLKIT_ENABLE_DEV_VIEW": "1" if developer_view else "0",
     }
+    timeout_sec = SCRIPT_TIMEOUT_SEC.get(script_path.name, DEFAULT_SCRIPT_TIMEOUT_SEC)
 
     proc = subprocess.Popen(
         cmd,
@@ -152,16 +165,28 @@ def _run_script(job: JobState, label: str, script_path: Path, kerberos: str) -> 
     assert proc.stdin is not None
     if script_path.name == "provision-gpu-and-metrics.sh":
         proc.stdin.write("Yes\n")
-        proc.stdin.close()
-    else:
-        proc.stdin.close()
+    proc.stdin.close()
 
     assert proc.stdout is not None
+    started = time.time()
+    timed_out = False
     for line in proc.stdout:
+        if time.time() - started > timeout_sec:
+            timed_out = True
+            proc.kill()
+            _append_log(job, f"\n❌ Step timed out after {timeout_sec}s")
+            break
         _append_log(job, line.rstrip("\n"))
 
     proc.wait()
+    if timed_out:
+        job.error = f"Timed out after {timeout_sec}s: {label}"
+        return False
+
     if proc.returncode != 0:
+        tail = job.logs[-8:]
+        summary = "\n".join(tail) if tail else f"exit code {proc.returncode}"
+        job.error = f"Failed at: {label}\n{summary}"
         _append_log(job, f"\n❌ Step failed with exit code {proc.returncode}")
         return False
 
@@ -178,6 +203,15 @@ def start_deployment(selected: dict[str, bool]) -> str:
     if not kerberos:
         raise ValueError("Connect to a cluster first (kerberos is used for S3 bucket names).")
 
+    info = cluster.get_cluster_info()
+    preflight = run_preflight(selected, info.platform)
+    if not preflight["ok"]:
+        raise ValueError("\n".join(preflight["errors"]))
+    for warning in preflight.get("warnings", []):
+        _append_log(job, f"⚠️  Preflight note: {warning}")
+
+    developer_view = bool(selected.get("developer_view"))
+
     job_id = str(uuid.uuid4())
     job = JobState(id=job_id, status="running", steps_total=len(plan))
     with _lock:
@@ -185,7 +219,7 @@ def start_deployment(selected: dict[str, bool]) -> str:
 
     def _worker() -> None:
         for label, script in plan:
-            ok = _run_script(job, label, script, kerberos)
+            ok = _run_script(job, label, script, kerberos, developer_view)
             if ok:
                 job.steps_completed += 1
             else:

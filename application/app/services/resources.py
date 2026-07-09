@@ -1,5 +1,35 @@
-from app.config import COMPONENT_RESOURCES, WORKER_INSTANCE_CPU, WORKER_INSTANCE_MEMORY_GI
+from app.config import (
+    COMPONENT_RESOURCES,
+    WORKER_INSTANCE_CPU,
+    WORKER_INSTANCE_DEFAULT,
+    WORKER_INSTANCE_MEMORY_GI,
+)
 from app.services.cluster import ClusterInfo
+
+
+def _find_worker_machineset_name() -> str | None:
+    import json
+    import subprocess
+
+    result = subprocess.run(
+        ["oc", "get", "machineset", "-n", "openshift-machine-api", "-o", "json"],
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=False,
+    )
+    if result.returncode != 0:
+        return None
+    try:
+        data = json.loads(result.stdout)
+    except json.JSONDecodeError:
+        return None
+    for item in data.get("items", []):
+        name = item.get("metadata", {}).get("name", "")
+        if "worker" in name and "gpu" not in name:
+            return name
+    items = data.get("items", [])
+    return items[0]["metadata"]["name"] if items else None
 
 
 def estimate_resources(
@@ -19,11 +49,15 @@ def estimate_resources(
     else:
         selected_users = False
 
+    worker_ms_name = _find_worker_machineset_name()
+
     for key, enabled in selected.items():
         if not enabled or key not in COMPONENT_RESOURCES:
             continue
 
         spec = COMPONENT_RESOURCES[key]
+        if spec.get("requires_loki") and not selected.get("loki"):
+            continue
         if spec.get("aws_only") and info.platform != "AWS":
             warnings.append(f"{spec['label']} requires an AWS cluster (detected: {info.platform or 'unknown'}).")
             continue
@@ -82,6 +116,15 @@ def estimate_resources(
         },
         "recommended_extra_workers": extra_workers,
         "gpu_extra_nodes": gpu_extra,
+        "worker_machineset": worker_ms_name,
+        "scale_assumption": (
+            f"Shortfall uses {WORKER_INSTANCE_DEFAULT} sizing ({WORKER_INSTANCE_CPU} CPU, "
+            f"{WORKER_INSTANCE_MEMORY_GI} Gi per node) to estimate how many workers to add."
+        ),
+        "scale_method": (
+            "Add worker nodes increases the replica count on your existing worker MachineSet "
+            "in openshift-machine-api (same EC2/instance type as current workers)."
+        ),
         "components": items,
         "warnings": warnings,
         "selected_users": selected_users,

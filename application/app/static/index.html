@@ -73,7 +73,7 @@
 
       <div class="card">
         <h2>System prerequisites</h2>
-        <p class="desc">Checking tools on your Mac or Linux machine (RHEL, Fedora, etc.).</p>
+        <p class="desc">Validates local tools and real AWS/GCP login (not just credential files). Fix any <strong>Not ready</strong> item before connecting.</p>
         <div id="prereq-list" class="check-list">
           <p class="desc"><span class="spinner"></span> Scanning…</p>
         </div>
@@ -106,6 +106,7 @@
           <input type="url" id="api-url" placeholder="https://api.cluster.example.com:6443" autocomplete="off" />
         </div>
         <div id="login-error" class="alert error hidden"></div>
+        <div id="session-validation" class="hidden"></div>
         <div id="cluster-info" class="hidden">
           <div class="alert success">Connected successfully.</div>
           <div class="cluster-summary" id="cluster-stats"></div>
@@ -124,44 +125,72 @@
         <h2>Select components to deploy</h2>
         <p class="desc">Read what each script does below, then tick what you want.</p>
         <div class="checkbox-grid">
-          <label class="checkbox-card" data-key="loki">
-            <input type="checkbox" name="component" value="loki" />
-            <img class="checkbox-operator-logo" src="/static/img/operators/loki.svg" alt="" width="48" height="48" />
-            <div class="menu-card-body">
-              <div class="title">Deploy logging with Loki</div>
-              <p class="menu-tagline">Full cluster logging stack on AWS or GCP</p>
-              <ul class="menu-summary">
-                <li>Install latest stable <strong>Loki Operator</strong>, <strong>Cluster Logging</strong> &amp; <strong>Cluster Observability Operator</strong></li>
-                <li>Deploy <strong>LokiStack</strong> (<code>1x.demo</code>) with S3/GCS object storage bucket</li>
-                <li>Configure <strong>ClusterLogForwarder</strong> — application, infrastructure &amp; audit logs</li>
-                <li>Enable <strong>Logging UI plugin</strong> in OpenShift Observe console</li>
-                <li>Auto-reuses empty buckets from the last 1.5 days to save resources</li>
+          <div class="checkbox-card" data-key="loki">
+            <label class="checkbox-card-main">
+              <input type="checkbox" name="component" value="loki" />
+              <img class="checkbox-operator-logo" src="/static/img/operators/loki.svg" alt="" width="48" height="48" />
+              <div class="menu-card-body">
+                <div class="title">Deploy logging with Loki</div>
+                <p class="menu-tagline">Full cluster logging stack on AWS or GCP</p>
+                <ul class="menu-summary">
+                  <li>Install latest stable <strong>Loki Operator</strong>, <strong>Cluster Logging</strong> &amp; <strong>Cluster Observability Operator</strong></li>
+                  <li>Deploy <strong>LokiStack</strong> (<code>1x.demo</code>) with S3/GCS object storage bucket</li>
+                  <li>Configure <strong>ClusterLogForwarder</strong> — application, infrastructure &amp; audit logs</li>
+                  <li>Enable <strong>Logging UI plugin</strong> in OpenShift Observe console</li>
+                  <li>Auto-reuses empty buckets from the last 1.5 days to save resources</li>
+                </ul>
+              </div>
+            </label>
+            <div class="sub-option-group" id="loki-alerting-group">
+              <label class="sub-option" id="loki-alerting-option">
+                <input type="checkbox" name="loki_alerting" value="loki_alerting" disabled />
+                <span class="sub-option-text">
+                  <strong>Per-user Loki log alerting</strong>
+                </span>
+              </label>
+              <ul class="sub-option-details" id="loki-alerting-details">
+                <li>Creates users <strong>aaa</strong> through <strong>zzz</strong> (password = username, e.g. <code>aaa</code> / <code>aaa</code>)</li>
+                <li>Each user gets their own project — <code>ns-testapp-logalert-&lt;user&gt;</code> (e.g. <code>ns-testapp-logalert-aaa</code>)</li>
+                <li>Deploys sample app + Loki alert per user — e.g. <code>TestAppHighErrorRate-aaa</code> (Observe → Alerts)</li>
+                <li>Grants project admin, application log view, and monitoring alert view RBAC automatically</li>
+                <li>Enables User Workload Monitoring and LokiStack rule evaluation for alerting namespaces</li>
               </ul>
+              <label class="sub-option sub-option-nested" id="developer-view-loki-option">
+                <input type="checkbox" name="developer_view_loki" disabled />
+                <span class="sub-option-text">
+                  <strong>Enable Developer console perspective</strong>
+                  <span class="sub-option-hint version-note">Tick only on <strong>OCP 4.19+</strong> — runs <code>oc patch console.operator.openshift.io/cluster …</code> to show the Developer view. On <strong>4.18 and earlier</strong> it is already enabled; leave unchecked.</span>
+                </span>
+              </label>
+              <p class="dev-view-ignore-msg hidden" id="developer-view-loki-msg" role="status"></p>
             </div>
-          </label>
+          </div>
 
-          <label class="checkbox-card" data-key="users">
-            <input type="checkbox" name="component" value="users" />
-            <img class="checkbox-operator-logo" src="/static/img/operators/users.svg" alt="" width="48" height="48" />
-            <div class="menu-card-body">
-              <div class="title">Deploy users aaa → zzz</div>
-              <p class="menu-tagline">HTPasswd identity provider + test accounts</p>
-              <ul class="menu-summary" id="users-summary-basic">
-                <li>Configure <strong>HTPasswd OAuth</strong> identity provider on the cluster</li>
-                <li>Create <strong>redadmin</strong> (cluster-admin) + users <strong>aaa</strong> through <strong>zzz</strong></li>
-                <li>Password for each user matches their username (e.g. <code>aaa</code> / <code>aaa</code>)</li>
-                <li>Smart merge — skips existing users, updates only what changed</li>
-                <li>Verifies every account can log in before finishing</li>
-              </ul>
-              <ul class="menu-summary hidden" id="users-summary-loki">
-                <li>Everything in the basic users setup, plus:</li>
-                <li>Enable <strong>User Workload Monitoring</strong> in Prometheus</li>
-                <li>Turn on <strong>LokiStack log-alerting rules</strong> (requires Loki)</li>
-                <li>Per user: dedicated namespace, test app, RBAC &amp; <strong>AlertingRule</strong> CR</li>
-                <li>26 demo projects — <code>ns-testapp-logalert-&lt;user&gt;</code></li>
-              </ul>
-            </div>
-          </label>
+          <div class="checkbox-card" data-key="users">
+            <label class="checkbox-card-main">
+              <input type="checkbox" name="component" value="users" />
+              <img class="checkbox-operator-logo" src="/static/img/operators/users.svg" alt="" width="48" height="48" />
+              <div class="menu-card-body">
+                <div class="title">Deploy users aaa → zzz + redadmin</div>
+                <p class="menu-tagline">HTPasswd identity provider — separate from Loki alerting</p>
+                <ul class="menu-summary" id="users-summary-basic">
+                  <li>Configure <strong>HTPasswd OAuth</strong> identity provider on the cluster</li>
+                  <li>Create <strong>redadmin</strong> (cluster-admin) + users <strong>aaa</strong> through <strong>zzz</strong></li>
+                  <li>Password for each user matches their username (e.g. <code>aaa</code> / <code>aaa</code>)</li>
+                  <li>Smart merge — skips existing users, updates only what changed</li>
+                  <li>Verifies every account can log in before finishing</li>
+                </ul>
+              </div>
+            </label>
+            <label class="sub-option sub-option-nested" id="developer-view-users-option">
+              <input type="checkbox" name="developer_view_users" disabled />
+              <span class="sub-option-text">
+                <strong>Enable Developer console perspective</strong>
+                <span class="sub-option-hint version-note">Tick only on <strong>OCP 4.19+</strong> — runs <code>oc patch console.operator.openshift.io/cluster …</code> to show the Developer view. On <strong>4.18 and earlier</strong> it is already enabled; leave unchecked.</span>
+              </span>
+            </label>
+            <p class="dev-view-ignore-msg hidden" id="developer-view-users-msg" role="status"></p>
+          </div>
 
           <label class="checkbox-card" data-key="acm">
             <input type="checkbox" name="component" value="acm" />

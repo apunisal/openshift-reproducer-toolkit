@@ -35,23 +35,34 @@ cleanup() {
 
 trap 'cleanup; exit 0' INT TERM
 
-# If something is already on the port, tell the user how to stop it
-if curl -sf "${URL}/api/health" >/dev/null 2>&1; then
-  OLD_PID=""
-  if [ -f .server.pid ]; then OLD_PID=$(cat .server.pid 2>/dev/null || true); fi
-  echo "Server is already running at ${URL}"
-  [ -n "$OLD_PID" ] && echo "  PID: $OLD_PID"
-  echo ""
-  echo "To stop it, run:  ./stop.sh"
-  echo "Or:              lsof -ti:${PORT} | xargs kill"
-  echo ""
-  echo "Opening browser…"
-  if command -v open >/dev/null 2>&1; then
-    open "$URL"
-  elif command -v xdg-open >/dev/null 2>&1; then
-    xdg-open "$URL" >/dev/null 2>&1 || true
+stop_existing_server() {
+  if [ -f .server.pid ]; then
+    OLD_PID=$(cat .server.pid 2>/dev/null || true)
+    if [ -n "$OLD_PID" ] && kill -0 "$OLD_PID" 2>/dev/null; then
+      echo "Stopping previous wizard (PID $OLD_PID)…"
+      kill "$OLD_PID" 2>/dev/null || true
+      wait "$OLD_PID" 2>/dev/null || true
+    fi
+    rm -f .server.pid
   fi
-  exit 0
+  if command -v lsof >/dev/null 2>&1; then
+    for PID in $(lsof -ti:"$PORT" 2>/dev/null || true); do
+      echo "Stopping process on port $PORT (PID $PID)…"
+      kill "$PID" 2>/dev/null || true
+    done
+  fi
+  # Wait for port to free
+  for _ in $(seq 1 10); do
+    if ! lsof -ti:"$PORT" >/dev/null 2>&1; then
+      return 0
+    fi
+    sleep 0.3
+  done
+}
+
+# Always stop any old instance (including stale servers from before application/ move)
+if curl -sf "${URL}/api/health" >/dev/null 2>&1 || lsof -ti:"$PORT" >/dev/null 2>&1; then
+  stop_existing_server
 fi
 
 echo "Starting OCP Reproducer Toolkit…"

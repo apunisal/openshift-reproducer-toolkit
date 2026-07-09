@@ -1,7 +1,7 @@
 const state = {
   step: 0,
   cluster: null,
-  selection: { loki: false, users: false, acm: false, gpu: false },
+  selection: { loki: false, loki_alerting: false, users: false, developer_view: false, acm: false, gpu: false },
   resourceEstimate: null,
   jobId: null,
 };
@@ -16,6 +16,7 @@ function goToStep(n) {
     d.classList.toggle("active", i === n);
     d.classList.toggle("done", i < n);
   });
+  if (n === 2) syncDeveloperViewHints();
 }
 
 async function api(path, options = {}) {
@@ -29,36 +30,167 @@ async function api(path, options = {}) {
 }
 
 function getSelection() {
-  const sel = { loki: false, users: false, acm: false, gpu: false };
+  const sel = {
+    loki: false,
+    loki_alerting: false,
+    users: false,
+    developer_view: false,
+    acm: false,
+    gpu: false,
+  };
   document.querySelectorAll('input[name="component"]:checked').forEach((el) => {
     sel[el.value] = true;
   });
+  const alertingEl = document.querySelector('input[name="loki_alerting"]');
+  sel.loki_alerting = !!(alertingEl?.checked && sel.loki);
+
+  const devUsers = document.querySelector('input[name="developer_view_users"]');
+  const devLoki = document.querySelector('input[name="developer_view_loki"]');
+  sel.developer_view =
+    (sel.users && devUsers?.checked) || (sel.loki_alerting && devLoki?.checked);
+
   state.selection = sel;
   return sel;
 }
 
-// Checkbox card styling + users summary toggle when Loki is selected
-function syncUsersSummary() {
-  const lokiOn = document.querySelector('input[value="loki"]')?.checked;
-  const basic = document.getElementById("users-summary-basic");
-  const loki = document.getElementById("users-summary-loki");
-  if (basic && loki) {
-    basic.classList.toggle("hidden", !!lokiOn);
-    loki.classList.toggle("hidden", !lokiOn);
+function ocpMinorVersion(version) {
+  const m = /^4\.(\d+)/.exec(version || "");
+  return m ? parseInt(m[1], 10) : null;
+}
+
+function developerViewIgnoreMessage(version) {
+  const display = version || "your cluster";
+  return `Nice try, but I'm ignoring that. 💅 ${display} already has it—I'm not just a pretty interface you know! 😎`;
+}
+
+function syncDeveloperViewHints() {
+  const ver = state.cluster?.openshift_version;
+  const minor = ocpMinorVersion(ver);
+  const showIgnore = minor !== null && minor < 19;
+
+  const pairs = [
+    ["developer_view_users", "developer-view-users-msg"],
+    ["developer_view_loki", "developer-view-loki-msg"],
+  ];
+
+  for (const [inputName, msgId] of pairs) {
+    const input = document.querySelector(`input[name="${inputName}"]`);
+    const msgEl = document.getElementById(msgId);
+    if (!input || !msgEl) continue;
+    if (input.checked && showIgnore) {
+      msgEl.textContent = developerViewIgnoreMessage(ver);
+      msgEl.classList.remove("hidden");
+    } else {
+      msgEl.textContent = "";
+      msgEl.classList.add("hidden");
+    }
   }
 }
 
+function syncLokiAlertingOption() {
+  const lokiOn = document.querySelector('input[value="loki"]')?.checked;
+  const lokiCard = document.querySelector('.checkbox-card[data-key="loki"]');
+  lokiCard?.classList.toggle("selected", !!lokiOn);
+
+  const alerting = document.querySelector('input[name="loki_alerting"]');
+  const alertingWrap = document.getElementById("loki-alerting-option");
+  const alertingGroup = document.getElementById("loki-alerting-group");
+  const devLoki = document.querySelector('input[name="developer_view_loki"]');
+  const devLokiWrap = document.getElementById("developer-view-loki-option");
+
+  if (alerting) {
+    alerting.disabled = !lokiOn;
+    if (!lokiOn) alerting.checked = false;
+  }
+  alertingWrap?.classList.toggle("disabled", !lokiOn);
+  alertingGroup?.classList.toggle("disabled", !lokiOn);
+
+  const alertingOn = !!(lokiOn && alerting?.checked);
+  const devLokiEnabled = alertingOn;
+  if (devLoki) {
+    devLoki.disabled = !devLokiEnabled;
+    if (!devLokiEnabled) devLoki.checked = false;
+  }
+  devLokiWrap?.classList.toggle("disabled", !devLokiEnabled);
+  syncDeveloperViewHints();
+}
+
+function syncUsersOptions() {
+  const usersOn = document.querySelector('input[value="users"]')?.checked;
+  const devUsers = document.querySelector('input[name="developer_view_users"]');
+  const devWrap = document.getElementById("developer-view-users-option");
+  const usersCard = document.querySelector('.checkbox-card[data-key="users"]');
+
+  if (devUsers) {
+    devUsers.disabled = !usersOn;
+    if (!usersOn) devUsers.checked = false;
+  }
+  devWrap?.classList.toggle("disabled", !usersOn);
+  usersCard?.classList.toggle("selected", !!usersOn);
+  syncDeveloperViewHints();
+}
+
 document.querySelectorAll(".checkbox-card").forEach((card) => {
-  const input = card.querySelector("input");
+  const input = card.querySelector('input[name="component"]');
+  if (!input) return;
   const sync = () => {
-    card.classList.toggle("selected", input.checked);
-    syncUsersSummary();
+    if (card.dataset.key !== "users") {
+      card.classList.toggle("selected", input.checked);
+    }
+    syncLokiAlertingOption();
+    syncUsersOptions();
   };
   input.addEventListener("change", sync);
   sync();
 });
 
+const lokiAlertingInput = document.querySelector('input[name="loki_alerting"]');
+if (lokiAlertingInput) {
+  lokiAlertingInput.addEventListener("change", () => {
+    syncLokiAlertingOption();
+    getSelection();
+  });
+}
+
+document.querySelectorAll('input[name="developer_view_users"], input[name="developer_view_loki"]').forEach((el) => {
+  el.addEventListener("change", () => {
+    getSelection();
+    syncDeveloperViewHints();
+  });
+});
+
+syncLokiAlertingOption();
+syncUsersOptions();
+
 // Prerequisites
+function prereqBadge(c) {
+  if (c.ok) return { cls: "ok", label: "OK" };
+  if (c.required) return { cls: "fail", label: "Missing" };
+  return { cls: "warn", label: "Not ready" };
+}
+
+function renderValidation(validation, failedOnly) {
+  if (!validation) return "";
+  const errs = validation.errors || [];
+  const warns = validation.warnings || [];
+  if (failedOnly && errs.length === 0) return "";
+
+  let html = "";
+  if (errs.length) {
+    html += `<div class="alert error"><strong>Cannot continue until these are fixed:</strong><ul class="validation-list">${errs
+      .map((e) => `<li>${e}</li>`)
+      .join("")}</ul></div>`;
+  } else if (!failedOnly && validation.ok) {
+    html += `<div class="alert success">Session checks passed — cloud and tools look good for this cluster.</div>`;
+  }
+  if (!failedOnly && warns.length) {
+    html += `<div class="alert warning"><ul class="validation-list">${warns
+      .map((w) => `<li>${w}</li>`)
+      .join("")}</ul></div>`;
+  }
+  return html;
+}
+
 async function loadPrereqs() {
   const list = document.getElementById("prereq-list");
   const btn = document.getElementById("btn-to-connect");
@@ -66,22 +198,28 @@ async function loadPrereqs() {
   try {
     const data = await api("/api/prereqs");
     list.innerHTML = data.checks
-      .map(
-        (c) => `
+      .map((c) => {
+        const b = prereqBadge(c);
+        return `
       <div class="check-item">
         <div>
           <div class="name">${c.name}</div>
           <div class="detail">${c.detail}</div>
         </div>
-        <span class="badge ${c.ok ? "ok" : c.required ? "fail" : "optional"}">
-          ${c.ok ? "OK" : c.required ? "Missing" : "Optional"}
-        </span>
-      </div>`
-      )
+        <span class="badge ${b.cls}">${b.label}</span>
+      </div>`;
+      })
       .join("");
+
+    const summaryClass = data.ready
+      ? data.cloud_ok
+        ? "success"
+        : "warning"
+      : "error";
     list.insertAdjacentHTML(
       "beforeend",
-      `<p class="desc" style="margin-top:0.75rem">Detected OS: <strong>${data.platform}</strong></p>`
+      `<div class="alert ${summaryClass}" style="margin-top:0.75rem">${data.summary}</div>
+       <p class="desc" style="margin-top:0.5rem">Detected OS: <strong>${data.platform}</strong></p>`
     );
     btn.disabled = !data.ready;
   } catch (e) {
@@ -97,8 +235,13 @@ document.getElementById("btn-to-connect").addEventListener("click", () => goToSt
 document.getElementById("btn-login").addEventListener("click", async () => {
   const errEl = document.getElementById("login-error");
   const infoEl = document.getElementById("cluster-info");
+  const valEl = document.getElementById("session-validation");
+  const btnComponents = document.getElementById("btn-to-components");
   errEl.classList.add("hidden");
   infoEl.classList.add("hidden");
+  valEl.classList.add("hidden");
+  valEl.innerHTML = "";
+  btnComponents.classList.add("hidden");
 
   const kerberos = document.getElementById("kerberos").value.trim();
   const apiUrl = document.getElementById("api-url").value.trim();
@@ -124,7 +267,19 @@ document.getElementById("btn-login").addEventListener("click", async () => {
     state.kerberos = data.kerberos || data.cluster?.kerberos;
     renderClusterStats(data.cluster);
     infoEl.classList.remove("hidden");
-    document.getElementById("btn-to-components").classList.remove("hidden");
+    syncDeveloperViewHints();
+
+    if (data.validation && !data.validation.ok) {
+      valEl.innerHTML = renderValidation(data.validation, true);
+      valEl.classList.remove("hidden");
+      btnComponents.classList.add("hidden");
+    } else {
+      if (data.validation) {
+        valEl.innerHTML = renderValidation(data.validation, false);
+        valEl.classList.remove("hidden");
+      }
+      btnComponents.classList.remove("hidden");
+    }
   } catch (e) {
     errEl.textContent = e.message;
     errEl.classList.remove("hidden");
@@ -154,6 +309,10 @@ document.getElementById("btn-to-resources").addEventListener("click", async () =
   const sel = getSelection();
   if (!Object.values(sel).some(Boolean)) {
     alert("Select at least one component.");
+    return;
+  }
+  if (document.querySelector('input[name="loki_alerting"]')?.checked && !sel.loki) {
+    alert("Per-user Loki log alerting requires Loki logging to be selected.");
     return;
   }
   goToStep(3);
@@ -203,11 +362,19 @@ async function loadResourceEstimate() {
         <div class="resource-row"><span>Memory required / available</span><span>${data.required.memory_gi} / ${data.available.memory_gi} Gi</span></div>
         <div class="bar-track"><div class="bar-fill mem" style="width:${memPct}%"></div></div>
       </div>
+      <p class="desc" style="margin-top:0.75rem">${data.scale_assumption || ""}</p>
       <ul style="margin:0.5rem 0 0 1.2rem;font-size:0.9rem;color:var(--text-muted)">${components}</ul>
       ${
         data.sufficient
           ? '<div class="alert success">Cluster has enough worker resources for the selected components.</div>'
-          : `<div class="alert warning">Insufficient resources. Recommend adding <strong>${data.recommended_extra_workers}</strong> worker node(s) (m5.2xlarge equivalent).</div>`
+          : `<div class="alert warning">Insufficient resources. Recommend adding <strong>${data.recommended_extra_workers}</strong> worker node(s).</div>`
+      }
+      ${
+        !data.sufficient && data.worker_machineset
+          ? `<div class="alert warning">${data.scale_method || ""} Target MachineSet: <code>${data.worker_machineset}</code></div>`
+          : !data.sufficient
+            ? `<div class="alert warning">${data.scale_method || ""}</div>`
+            : ""
       }
       ${
         data.gpu_extra_nodes
@@ -297,7 +464,33 @@ async function startDeployment() {
   document.getElementById("btn-back-deploy").disabled = true;
   document.getElementById("btn-finish").classList.add("hidden");
 
+  statusText.textContent = "Running preflight checks…";
+
   try {
+    const preflight = await api("/api/deploy/preflight", {
+      method: "POST",
+      body: JSON.stringify(state.selection),
+    });
+
+    if (!preflight.ok) {
+      statusText.textContent = "Preflight failed — fix issues and try again";
+      const lines = (preflight.errors || []).map((e) => `ERROR: ${e}`);
+      showDeployErrors(lines, "Deployment blocked by preflight checks.");
+      logBox.textContent = lines.join("\n");
+      document.getElementById("btn-back-deploy").disabled = false;
+      return;
+    }
+
+    if (preflight.warnings?.length) {
+      preflight.warnings.forEach((w) => {
+        const span = document.createElement("div");
+        span.className = "line-warn";
+        span.textContent = `⚠️  ${w}`;
+        logBox.appendChild(span);
+      });
+    }
+
+    statusText.textContent = "Starting deployment…";
     const { job_id } = await api("/api/deploy", {
       method: "POST",
       body: JSON.stringify(state.selection),

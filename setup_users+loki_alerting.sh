@@ -18,18 +18,17 @@
 # - The 'oc' CLI tool installed locally.
 # =======================================================
 
-set -euo pipefail
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=lib/common.sh
+source "$SCRIPT_DIR/lib/common.sh"
+
+require_cluster_admin
 
 LOGFILE="openshift_setup_$(date +%F_%H-%M-%S).log"
 FAILED_USERS="failed_users_$(date +%F_%H-%M-%S).txt"
+USER_FAILURES=0
 
 echo "📝 Logging output to: $LOGFILE"
-
-echo "🔍 Checking OpenShift connection..."
-if ! oc whoami >/dev/null 2>&1; then
-  echo "❌ You are not logged in. Please run 'oc login' as an administrator first."
-  exit 1
-fi
 
 # === 1. Identity Provider (HTPasswd) ===
 if ! oc get oauth cluster -o jsonpath='{.spec.identityProviders[*].type}' 2>/dev/null | grep -q "HTPasswd"; then
@@ -83,8 +82,10 @@ spec:
 EOF
     
     echo "⏳ Waiting for authentication operator to stabilize..."
-    sleep 10 
-    oc wait --for=condition=Progressing=False clusteroperator/authentication --timeout=5m >>"$LOGFILE" 2>&1 || true
+    sleep 10
+    if ! oc wait --for=condition=Progressing=False clusteroperator/authentication --timeout=5m >>"$LOGFILE" 2>&1; then
+      die "Authentication operator did not stabilize after HTPasswd configuration. See $LOGFILE"
+    fi
 else
     echo "ℹ️ OAuth HTPasswd already configured. Skipping."
 fi
@@ -130,12 +131,22 @@ USERS="aaa bbb ccc ddd eee fff ggg hhh iii jjj kkk lll mmm nnn ooo ppp qqq rrr s
 
 for user in $USERS; do
   PROJECT="ns-testapp-logalert-$user"
+  set +e
   if ! oc get project "$PROJECT" >/dev/null 2>&1; then
-    oc new-project "$PROJECT" >>"$LOGFILE" 2>&1
+    if ! oc new-project "$PROJECT" >>"$LOGFILE" 2>&1; then
+      echo "$user: failed to create project $PROJECT" >>"$FAILED_USERS"
+      USER_FAILURES=$((USER_FAILURES + 1))
+      set -e
+      continue
+    fi
   fi
-  oc label namespace "$PROJECT" openshift.io/log-alerting='true' --overwrite >>"$LOGFILE" 2>&1
-
-  cat <<EOF | oc apply -f - >>"$LOGFILE" 2>&1
+  if ! oc label namespace "$PROJECT" openshift.io/log-alerting='true' --overwrite >>"$LOGFILE" 2>&1; then
+    echo "$user: failed to label namespace $PROJECT" >>"$FAILED_USERS"
+    USER_FAILURES=$((USER_FAILURES + 1))
+    set -e
+    continue
+  fi
+  if ! oc apply -f - >>"$LOGFILE" 2>&1 <<EOF
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
@@ -225,7 +236,18 @@ spec:
         severity: critical
   tenantID: application
 EOF
+  then
+    echo "$user: failed to apply manifests in $PROJECT" >>"$FAILED_USERS"
+    USER_FAILURES=$((USER_FAILURES + 1))
+  fi
+  set -e
 done
+
+if [ "$USER_FAILURES" -gt 0 ]; then
+  die "${USER_FAILURES} user(s) failed — details in ${FAILED_USERS}"
+fi
+
+maybe_enable_developer_perspective
 
 echo "✅ All users processed."
 echo "🎉 Script complete. Ready for team use."

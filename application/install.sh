@@ -47,7 +47,7 @@ echo "✓ Dependencies installed"
 # --- Script permissions (repo root, sibling of application/) ---
 REPO_ROOT="$(cd "$ROOT/.." && pwd)"
 MARKED=0
-for f in "$REPO_ROOT"/*.sh "$REPO_ROOT"/loki-install-aws-gcp-loki-script; do
+for f in "$REPO_ROOT"/*.sh "$REPO_ROOT"/loki-install-aws-gcp-loki-script "$REPO_ROOT"/lib/common.sh; do
   if [ -f "$f" ]; then
     chmod +x "$f" 2>/dev/null || true
     MARKED=1

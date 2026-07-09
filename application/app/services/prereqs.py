@@ -3,6 +3,8 @@ import shutil
 import subprocess
 from pathlib import Path
 
+from app.services.cloud_creds import validate_aws, validate_gcp
+
 
 def _which(cmd: str) -> str | None:
     return shutil.which(cmd)
@@ -27,13 +29,14 @@ def _run_version(cmd: list[str]) -> str | None:
 def check_prerequisites() -> dict:
     checks: list[dict] = []
 
-    def add(name: str, ok: bool, detail: str, required: bool = True):
+    def add(name: str, ok: bool, detail: str, *, required: bool = True, group: str = "core"):
         checks.append(
             {
                 "name": name,
                 "ok": ok,
                 "detail": detail,
                 "required": required,
+                "group": group,
             }
         )
 
@@ -41,47 +44,80 @@ def check_prerequisites() -> dict:
     add(
         "python3",
         python_ok,
-        _run_version(["python3", "--version"]) or "Not found",
+        _run_version(["python3", "--version"]) or "Not found — required to run this wizard",
     )
 
-    oc_path = _which("oc")
-    oc_ok = oc_path is not None
-    add("oc CLI", oc_ok, _run_version(["oc", "version", "--client"]) or "Not found")
-
-    aws_cli = _which("aws")
-    aws_creds = Path.home() / ".aws" / "credentials"
-    aws_creds_ok = aws_creds.is_file()
+    oc_ok = _which("oc") is not None
     add(
-        "AWS CLI + credentials",
-        aws_cli is not None and aws_creds_ok,
-        f"{_run_version(['aws', '--version']) or 'aws not found'}; credentials: {'found' if aws_creds_ok else 'missing ~/.aws/credentials'}",
-        required=False,
+        "oc CLI",
+        oc_ok,
+        _run_version(["oc", "version", "--client"]) or "Not found — required for cluster access",
     )
 
-    gcp_dir = Path.home() / ".gcp"
-    gcp_files = list(gcp_dir.glob("*.json")) if gcp_dir.is_dir() else []
-    gcp_ok = len(gcp_files) > 0
-    add(
-        "GCP credentials",
-        gcp_ok,
-        f"Found {len(gcp_files)} key file(s) in ~/.gcp/" if gcp_ok else "No ~/.gcp/*.json found",
-        required=False,
-    )
-
-    for tool in ("jq", "htpasswd", "openssl", "gcloud"):
+    for tool, why in (
+        ("jq", "GPU script and JSON helpers"),
+        ("htpasswd", "bcrypt password generation for user scripts"),
+        ("openssl", "random bucket suffixes for Loki/ACM"),
+    ):
         found = _which(tool) is not None
         add(
             tool,
             found,
-            "Installed" if found else "Not found (may be needed for some options)",
-            required=False,
+            f"Installed ({why})" if found else f"Not found — required: {why}",
         )
 
-    required_ok = all(c["ok"] for c in checks if c["required"])
+    aws_ok, aws_detail = validate_aws()
+    add(
+        "AWS CLI + login",
+        aws_ok,
+        aws_detail,
+        required=False,
+        group="cloud",
+    )
+
+    gcp_ok, gcp_detail = validate_gcp()
+    add(
+        "GCP credentials + login",
+        gcp_ok,
+        gcp_detail,
+        required=False,
+        group="cloud",
+    )
+
+    core_ok = all(c["ok"] for c in checks if c["required"])
+    cloud_ok = aws_ok or gcp_ok
+
+    summary: list[str] = []
+    if not core_ok:
+        summary.append("Install all missing core tools before continuing.")
+    if not aws_ok:
+        summary.append(f"AWS not ready: {aws_detail}")
+    if not gcp_ok:
+        summary.append(f"GCP not ready: {gcp_detail}")
+    if core_ok and not cloud_ok:
+        summary.append(
+            "Fix AWS or GCP login before connecting — clusters in this toolkit use cloud storage."
+        )
+    elif core_ok and cloud_ok:
+        parts = []
+        if aws_ok:
+            parts.append("AWS")
+        if gcp_ok:
+            parts.append("GCP")
+        summary.append(f"Core tools OK. Cloud ready: {', '.join(parts)}.")
+
+    # Step 1: core tools only. Cloud is validated again at connect for the cluster platform.
+    ready = core_ok
+
     return {
-        "ready": required_ok,
+        "ready": ready,
+        "core_ok": core_ok,
+        "cloud_ok": cloud_ok,
+        "aws_ok": aws_ok,
+        "gcp_ok": gcp_ok,
         "checks": checks,
         "platform": _detect_os(),
+        "summary": " ".join(summary),
     }
 
 

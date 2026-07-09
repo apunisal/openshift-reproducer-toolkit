@@ -19,8 +19,12 @@
 # - Active session to the OpenShift cluster via 'oc login'.
 # - Installed CLIs: oc, aws (if AWS), gcloud/gsutil (if GCP).
 
-# Exit on error
-set -e
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=lib/common.sh
+source "$SCRIPT_DIR/lib/common.sh"
+
+require_cluster_admin
+require_platform_aws_or_gcp
 
 # --- 0. DETECT CLUSTER CONTEXT & USER VARIABLES ---
 echo "--- Checking Current Environment & Cluster ---"
@@ -29,9 +33,9 @@ if [ -z "$CLUSTER_NAME" ]; then
     CLUSTER_NAME=$(oc config current-context 2>/dev/null || echo "UNKNOWN_CLUSTER")
 fi
 
-# Sanitize hostname for S3/GCP bucket naming rules (lowercase, alphanumeric, no capital letters)
-HOST_NAME=$(hostname -s | tr '[:upper:]' '[:lower:]' | tr -cd 'a-z0-9' | head -c 15)
-BUCKET_PREFIX="loki-${HOST_NAME}"
+# Sanitize bucket key — wizard kerberos when set, else local hostname (standalone).
+BUCKET_KEY=$(toolkit_bucket_key)
+BUCKET_PREFIX="loki-${BUCKET_KEY}"
 
 echo "Script logged in to cluster: ${CLUSTER_NAME}"
 echo "Bucket Prefix will be: ${BUCKET_PREFIX}-<random>"
@@ -53,33 +57,18 @@ fi
 if [ "$PLATFORM_TYPE" = "AWS" ]; then
     CLOUD_REGION=$(oc get infrastructure cluster -o jsonpath='{.status.platformStatus.aws.region}')
     echo "Detected AWS platform in region: $CLOUD_REGION"
-    
-    AWS_ACCESS_KEY_ID=$(aws configure get aws_access_key_id || true)
-    AWS_SECRET_ACCESS_KEY=$(aws configure get aws_secret_access_key || true)
-    
-    if [ -z "$AWS_ACCESS_KEY_ID" ] || [ -z "$AWS_SECRET_ACCESS_KEY" ]; then
-        echo "ERROR: AWS credentials not found. Please ensure ~/.aws/credentials exists or run 'aws configure'." >&2
-        exit 1
-    fi
+    require_aws_credentials
+    AWS_ACCESS_KEY_ID=$(aws configure get aws_access_key_id)
+    AWS_SECRET_ACCESS_KEY=$(aws configure get aws_secret_access_key)
     STORAGE_CLASS=${DEFAULT_SC:-"gp3-csi"}
 
 elif [ "$PLATFORM_TYPE" = "GCP" ]; then
     CLOUD_REGION=$(oc get infrastructure cluster -o jsonpath='{.status.platformStatus.gcp.region}')
     echo "Detected GCP platform in region: $CLOUD_REGION"
-    
-    GCP_CRED_FILE=$(ls "${HOME}/.gcp/"*.json 2>/dev/null | head -n 1 || true)
-    
-    if [ -z "$GCP_CRED_FILE" ] || [ ! -f "$GCP_CRED_FILE" ]; then
-        echo "ERROR: GCP credential (.json) file not found in ${HOME}/.gcp/." >&2
-        exit 1
-    fi
-    
-    echo "Using GCP credentials from: $GCP_CRED_FILE"
-    gcloud auth activate-service-account --key-file="$GCP_CRED_FILE" >/dev/null 2>&1
+    GCP_CRED_FILE=$(require_gcp_credentials)
     STORAGE_CLASS=${DEFAULT_SC:-"standard-csi"}
 else
-    echo "ERROR: Unsupported platform '$PLATFORM_TYPE'." >&2
-    exit 1
+    die "Unsupported platform '${PLATFORM_TYPE}'. This script supports AWS and GCP only."
 fi
 
 echo "StorageClass selected for LokiStack: $STORAGE_CLASS"
@@ -296,6 +285,13 @@ EOF
         sleep 5
     done
     echo "ERROR: Timeout waiting for $NAME to reach Succeeded phase."
+    echo "  Namespace: $NS"
+    echo "  Channel: $CHANNEL"
+    local LAST_CSV LAST_PHASE
+    LAST_CSV=$(oc get sub "$NAME" -n "$NS" -o jsonpath='{.status.currentCSV}' 2>/dev/null || true)
+    LAST_PHASE=$( [ -n "$LAST_CSV" ] && oc get csv "$LAST_CSV" -n "$NS" -o jsonpath='{.status.phase}' 2>/dev/null || echo "unknown" )
+    echo "  Last CSV: ${LAST_CSV:-none} (phase: ${LAST_PHASE})"
+    echo "  Tip: oc get sub,csv -n $NS ; oc describe csv -n $NS"
     exit 1
 }
 
@@ -306,6 +302,8 @@ LOG_CH=$(get_latest_channel "cluster-logging")
 install_operator "loki-operator" "openshift-operators-redhat" "$LOKI_CH"
 install_operator "cluster-observability-operator" "openshift-cluster-observability-operator" "$COO_CH"
 install_operator "cluster-logging" "openshift-logging" "$LOG_CH"
+
+[ -n "${BUCKET_NAME:-}" ] || die "Storage bucket was not created or selected. Check AWS/GCP credentials and permissions."
 
 # --- 4. CONFIGURE LOKI STORAGE SECRET ---
 echo "--- Configuring LokiStack Storage ---"

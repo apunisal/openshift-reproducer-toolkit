@@ -34,6 +34,7 @@ class ClusterInfo:
     infrastructure_name: str | None
     platform: str | None
     region: str | None
+    openshift_version: str | None
     worker_nodes: list[NodeResources]
     total_cpu: float
     total_memory_gi: float
@@ -95,6 +96,7 @@ def get_cluster_info() -> ClusterInfo:
             infrastructure_name=None,
             platform=None,
             region=None,
+            openshift_version=None,
             worker_nodes=[],
             total_cpu=0,
             total_memory_gi=0,
@@ -132,6 +134,10 @@ def get_cluster_info() -> ClusterInfo:
                 "jsonpath={.status.platformStatus.gcp.region}",
             ]
         ).stdout.strip() or None
+
+    openshift_version = _run_oc(
+        ["get", "clusterversion", "version", "-o", "jsonpath={.status.desired.version}"]
+    ).stdout.strip() or None
 
     nodes_json = _run_oc(["get", "nodes", "-o", "json"])
     workers: list[NodeResources] = []
@@ -178,6 +184,7 @@ def get_cluster_info() -> ClusterInfo:
         infrastructure_name=infra,
         platform=platform,
         region=region,
+        openshift_version=openshift_version,
         worker_nodes=workers,
         total_cpu=round(total_cpu, 2),
         total_memory_gi=round(total_memory, 2),
@@ -194,6 +201,7 @@ def cluster_info_to_dict(info: ClusterInfo) -> dict:
         "infrastructure_name": info.infrastructure_name,
         "platform": info.platform,
         "region": info.region,
+        "openshift_version": info.openshift_version,
         "worker_count": len(info.worker_nodes),
         "total_cpu": info.total_cpu,
         "total_memory_gi": info.total_memory_gi,

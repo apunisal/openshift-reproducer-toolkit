@@ -103,6 +103,10 @@ Live streamed logs from each script.
 
 ![Deploy — live script output](application/docs/images/06-deploy.png)
 
+When everything finishes:
+
+![Deploy — all steps completed successfully](application/docs/images/07-deploy-success.png)
+
 ---
 
 ## Kerberos & bucket naming

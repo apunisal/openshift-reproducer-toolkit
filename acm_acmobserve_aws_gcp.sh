@@ -27,6 +27,10 @@
 # - 'python3' installed locally to ensure cross-platform timestamp parsing for the bucket reuse logic.
 # =======================================================
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=lib/common.sh
+source "$SCRIPT_DIR/lib/common.sh"
+
 ACM_NAMESPACE="open-cluster-management"
 OBS_NAMESPACE="open-cluster-management-observability"
 LOG_FILE="acm-install-logs.txt"
@@ -34,6 +38,8 @@ LOG_FILE="acm-install-logs.txt"
 # 1. Main Function to wrap logic for tee
 run_install() {
     echo "--- Starting Installation: $(date) ---"
+    require_cluster_admin
+    require_platform_aws_or_gcp
 
     # --- Announce Connected Cluster ---
     CURRENT_CLUSTER=$(oc get infrastructure cluster -o jsonpath='{.status.infrastructureName}' 2>/dev/null)
@@ -96,10 +102,12 @@ run_install() {
         echo "AWS Region set to: $CLOUD_REGION based on cluster location."
 
     elif [ "$PLATFORM" == "GCP" ]; then
-        # Strictly look for osServiceAccount.json as requested
         GCP_CREDS_FILE="$HOME/.gcp/osServiceAccount.json"
+        if [ ! -f "$GCP_CREDS_FILE" ]; then
+            GCP_CREDS_FILE=$(ls "${HOME}/.gcp/"*.json 2>/dev/null | head -n 1 || true)
+        fi
         
-        if [ -f "$GCP_CREDS_FILE" ]; then
+        if [ -n "$GCP_CREDS_FILE" ] && [ -f "$GCP_CREDS_FILE" ]; then
             echo "Found GCP credentials at $GCP_CREDS_FILE."
             
             gcloud auth activate-service-account --key-file="$GCP_CREDS_FILE" >/dev/null 2>&1
@@ -130,12 +138,28 @@ run_install() {
     }
 
     wait_for_crd() {
-        echo "Waiting for CRD $1..."
-        until oc get crd "$1" >/dev/null 2>&1; do
-            echo "  > Still waiting for $1 to appear..."
-            sleep 15
+        wait_for_cmd "CRD $1" "${2:-900}" 15 oc get crd "$1"
+    }
+
+    wait_for_mch_running() {
+        local timeout_sec="${1:-1800}"
+        local elapsed=0
+        local interval=20
+        info "Waiting for MultiClusterHub phase: Running (timeout ${timeout_sec}s)..."
+        while true; do
+            local phase
+            phase=$(oc get mch multiclusterhub -n "$ACM_NAMESPACE" -o jsonpath='{.status.phase}' 2>/dev/null || echo "Pending")
+            if [ "$phase" = "Running" ]; then
+                info "MultiClusterHub is Running"
+                return 0
+            fi
+            if [ "$elapsed" -ge "$timeout_sec" ]; then
+                die "Timeout waiting for MultiClusterHub Running (last phase: ${phase})"
+            fi
+            echo "  > MCH status: ${phase} (${elapsed}s elapsed)"
+            sleep "$interval"
+            elapsed=$((elapsed + interval))
         done
-        echo "Successfully found CRD $1"
     }
 
     # 2. Strictly Get Latest ACM Channel
@@ -195,11 +219,7 @@ spec:
   localClusterName: local-cluster
 EOF
         
-        echo "Waiting for MultiClusterHub phase: Running (this takes minutes)..."
-        until [ "$(oc get mch multiclusterhub -n $ACM_NAMESPACE -o jsonpath='{.status.phase}' 2>/dev/null)" == "Running" ]; do
-            echo "  > MCH status: $(oc get mch multiclusterhub -n $ACM_NAMESPACE -o jsonpath='{.status.phase}' 2>/dev/null || echo 'Pending')"
-            sleep 20
-        done
+        wait_for_mch_running 1800
     fi
 
     # 6. Observability Namespace
@@ -211,9 +231,8 @@ EOF
     if ! resource_exists "secret" "thanos-object-storage" "$OBS_NAMESPACE"; then
         
         BUCKET_READY=false
-        LOCAL_HOST=$(hostname -s | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9-]/-/g')
-        # Appended hyphen here to explicitly match "acm-observe-<hostname>-"
-        BUCKET_PREFIX="acm-observe-${LOCAL_HOST}-"
+        BUCKET_KEY=$(toolkit_bucket_key)
+        BUCKET_PREFIX="acm-observe-${BUCKET_KEY}-"
         
         # Calculate time 1.5 days ago (129600 seconds)
         CURRENT_TIME=$(date +%s)
@@ -355,5 +374,7 @@ EOF
     echo "--- Finished: $(date) ---"
 }
 
-# Invoke the function and pipe EVERYTHING to tee
+# Invoke the function and pipe output to log; preserve real exit code for the wizard.
+set -o pipefail
 run_install 2>&1 | tee "$LOG_FILE"
+exit "${PIPESTATUS[0]}"

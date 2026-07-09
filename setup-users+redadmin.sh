@@ -15,14 +15,11 @@
 # - Active session to the OpenShift cluster via 'oc login' as a cluster-admin.
 # =======================================================
 
-set -euo pipefail
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=lib/common.sh
+source "$SCRIPT_DIR/lib/common.sh"
 
-echo "🔍 Checking OpenShift connection..."
-if ! oc whoami >/dev/null 2>&1; then
-  echo "❌ ERROR: You are not logged in. Please run 'oc login' as an administrator first."
-  exit 1
-fi
-
+require_cluster_admin
 SERVER=$(oc whoami --show-server)
 echo "✅ Logged in to: $SERVER"
 
@@ -125,7 +122,9 @@ rm -f current_users.htpasswd clean.htpasswd
 
 # === 5. Grant Admin Rights to redadmin ===
 echo "👑 Granting cluster-admin permissions to 'redadmin'..."
-oc adm policy add-cluster-role-to-user cluster-admin redadmin >/dev/null 2>&1 || echo "⚠️  Warning: Could not assign role. Skipping."
+if ! oc adm policy add-cluster-role-to-user cluster-admin redadmin 2>&1; then
+    die "Failed to grant cluster-admin to redadmin. Check RBAC and that the HTPasswd user exists."
+fi
 
 # === 6. Force Instant Pod Reload ===
 if [ "$CHANGES_MADE" = true ]; then
@@ -193,17 +192,25 @@ fi
 # === 9. Verify all user logins ===
 echo "🔄 Verifying login for all users..."
 USERS="aaa bbb ccc ddd eee fff ggg hhh iii jjj kkk lll mmm nnn ooo ppp qqq rrr sss ttt uuu vvv www xxx yyy zzz redadmin"
+LOGIN_FAILURES=0
 
 for user in $USERS; do
   if oc login -u "$user" -p "$user" --server="$SERVER" --insecure-skip-tls-verify=true >/dev/null 2>&1; then
     echo "  ✅ User $user logged in successfully."
   else
     echo "  ❌ ERROR: User $user login FAILED."
+    LOGIN_FAILURES=$((LOGIN_FAILURES + 1))
   fi
 done
+
+if [ "$LOGIN_FAILURES" -gt 0 ]; then
+  die "${LOGIN_FAILURES} user login(s) failed. Check authentication pods and htpass-secret."
+fi
 
 # === 10. Restore Admin Session ===
 echo "🔄 Restoring admin session as 'redadmin'..."
 oc login -u redadmin -p redadmin --server="$SERVER" --insecure-skip-tls-verify=true >/dev/null 2>&1
+
+maybe_enable_developer_perspective
 
 echo "🎉 Script complete. All users configured and verified. You are currently logged in as 'redadmin'."

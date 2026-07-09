@@ -5,6 +5,10 @@
 # Tools used: Gemini
 # =======================================================
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=lib/common.sh
+source "$SCRIPT_DIR/lib/common.sh"
+
 # --- CONFIGURATION ---
 GPU_INSTANCE_TYPE="g4dn.xlarge"
 REPLICAS=2
@@ -31,18 +35,14 @@ echo "⚠️  PREREQUISITE: You must be logged into your AWS cluster via the CLI
 echo "   Example: oc login -u kubeadmin -p XXX --server=https://api.XXX:6443"
 echo ""
 
-read -p "Should I go ahead? (Yes/No): " ACK
-if [[ ! "$ACK" =~ ^[Yy](es)?$ ]]; then
-    echo "🛑 Script aborted by user. Exiting."
-    exit 0
-fi
-echo ""
+confirm_or_abort "Should I go ahead?"
 
 # Pre-flight Checks (Run after acknowledgment)
-if ! command -v jq &> /dev/null; then echo "❌ Error: jq is required but not installed."; exit 1; fi
-if ! oc whoami &> /dev/null; then echo "❌ Error: You are not logged into oc. Please run 'oc login' first."; exit 1; fi
+require_command jq
+require_cluster_admin
+require_platform_aws
 
-echo "-------------------------------------------------------"
+echo ""
 echo "🔍 PHASE 1: MachineSet Infrastructure"
 echo "-------------------------------------------------------"
 
@@ -153,6 +153,10 @@ for i in {1..20}; do
     echo "   Waiting... (Attempt $i/20) | NFD: ${NFD_STATUS:-Pending} | GPU: ${GPU_STATUS:-Pending}"
     sleep 10
 done
+
+if [[ "$NFD_STATUS" != "Succeeded" || "$GPU_STATUS" != "Succeeded" ]]; then
+    die "GPU operators did not reach Succeeded (NFD: ${NFD_STATUS:-missing}, GPU: ${GPU_STATUS:-missing}). Check: oc get csv -n ${NFD_NS} and oc get csv -n ${GPU_NS}"
+fi
 
 echo "-------------------------------------------------------"
 echo "⚡ PHASE 3: Apply NFD Instance & GPU ClusterPolicy"

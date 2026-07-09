@@ -7,6 +7,8 @@ from pydantic import BaseModel, Field
 
 from app.config import HOST, PORT, ROOT_DIR
 from app.services import cluster, prereqs, resources, runner
+from app.services.preflight import run_preflight
+from app.services.session_validate import validate_session
 
 app = FastAPI(title="OCP Reproducer Toolkit", version="0.1.0")
 
@@ -23,7 +25,9 @@ class LoginRequest(BaseModel):
 
 class SelectionRequest(BaseModel):
     loki: bool = False
+    loki_alerting: bool = False
     users: bool = False
+    developer_view: bool = False
     acm: bool = False
     gpu: bool = False
 
@@ -39,6 +43,12 @@ async def index():
 
 @app.get("/api/health")
 async def health():
+    index = static_dir / "index.html"
+    if not index.is_file():
+        raise HTTPException(
+            status_code=503,
+            detail=f"Wizard UI not found at {index}. Run ./start.sh from the application/ folder.",
+        )
     return {"ok": True, "host": HOST, "port": PORT}
 
 
@@ -53,10 +63,12 @@ async def cluster_login(body: LoginRequest):
     if not result["ok"]:
         raise HTTPException(status_code=400, detail=result["error"])
     info = cluster.get_cluster_info()
+    validation = validate_session(info)
     return {
         "ok": True,
         "cluster": cluster.cluster_info_to_dict(info),
         "kerberos": cluster.sanitize_kerberos(body.kerberos),
+        "validation": validation,
     }
 
 
@@ -82,6 +94,14 @@ async def scale_workers(body: ScaleRequest):
     return result
 
 
+@app.post("/api/deploy/preflight")
+async def deploy_preflight(body: SelectionRequest):
+    info = cluster.get_cluster_info()
+    if not info.connected:
+        raise HTTPException(status_code=400, detail="Connect to a cluster first")
+    return run_preflight(body.model_dump(), info.platform)
+
+
 @app.post("/api/deploy")
 async def deploy(body: SelectionRequest):
     info = cluster.get_cluster_info()
@@ -91,6 +111,12 @@ async def deploy(body: SelectionRequest):
     selected = body.model_dump()
     if not any(selected.values()):
         raise HTTPException(status_code=400, detail="Select at least one component")
+
+    if selected.get("loki_alerting") and not selected.get("loki"):
+        raise HTTPException(
+            status_code=400,
+            detail="Per-user Loki log alerting requires the Loki logging stack to be selected.",
+        )
 
     if selected.get("gpu") and info.platform != "AWS":
         raise HTTPException(

@@ -19,7 +19,13 @@ SCRIPT_MAP = {
 # Approximate allocatable headroom required on existing worker nodes (not GPU nodes).
 COMPONENT_RESOURCES = {
     "loki": {"cpu_cores": 2.0, "memory_gi": 8.0, "label": "Loki logging stack"},
-    "users": {"cpu_cores": 1.0, "memory_gi": 4.0, "label": "HTPasswd users (aaa–zzz)"},
+    "loki_alerting": {
+        "cpu_cores": 1.0,
+        "memory_gi": 4.0,
+        "label": "Per-user Loki log alerting (aaa–zzz)",
+        "requires_loki": True,
+    },
+    "users": {"cpu_cores": 1.0, "memory_gi": 4.0, "label": "HTPasswd users (aaa–zzz + redadmin)"},
     "acm": {"cpu_cores": 6.0, "memory_gi": 24.0, "label": "ACM + Observability"},
     "gpu": {
         "cpu_cores": 0.0,
