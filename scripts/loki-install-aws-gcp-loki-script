@@ -1,0 +1,454 @@
+#!/bin/bash
+
+# =======================================================
+# Created by Apurva Nisal
+# Tools used: Gemini
+# =======================================================
+#
+# Features:
+# - Dynamic context, platform, and cluster region auto-detection (AWS & GCP).
+# - Automatic credential loading from home directory structures (~/.aws or ~/.gcp).
+# - Smart storage bucket recycling (automatically reuses matching buckets if empty or under 1.5 days old).
+# - Bulletproof bucket naming using local machine hostname to prevent collisions (loki-<hostname>-<random>).
+# - Advanced OLM operator self-healing (nukes stuck alpha/failed subs/CSVs to force clean stable installs).
+# - Auto-detects the cluster's active default StorageClass with fallback options.
+# - Cloud-provider specification matching (handles AWS 'bucketnames' vs GCP 'bucketname' secret quirks).
+# - Seamless cross-platform Mac/Linux compatibility (universal date and base64 handling).
+#
+# Prerequisites:
+# - Active session to the OpenShift cluster via 'oc login'.
+# - Installed CLIs: oc, aws (if AWS), gcloud/gsutil (if GCP).
+
+# Exit on error
+set -e
+
+# --- 0. DETECT CLUSTER CONTEXT & USER VARIABLES ---
+echo "--- Checking Current Environment & Cluster ---"
+CLUSTER_NAME=$(oc get infrastructure cluster -o jsonpath='{.status.infrastructureName}' 2>/dev/null || true)
+if [ -z "$CLUSTER_NAME" ]; then
+    CLUSTER_NAME=$(oc config current-context 2>/dev/null || echo "UNKNOWN_CLUSTER")
+fi
+
+# Bucket naming: kerberos from wizard → loki-<kerberos>-<random>
+if [ -n "${OCP_TOOLKIT_KERBEROS:-}" ]; then
+  KERBEROS=$(echo "$OCP_TOOLKIT_KERBEROS" | tr '[:upper:]' '[:lower:]' | tr -cd 'a-z0-9' | head -c 15)
+  echo "Using kerberos for bucket prefix: ${KERBEROS}"
+elif [ -n "${OCP_TOOLKIT_BUCKET_USER:-}" ]; then
+  KERBEROS=$(echo "$OCP_TOOLKIT_BUCKET_USER" | tr '[:upper:]' '[:lower:]' | tr -cd 'a-z0-9' | head -c 15)
+  echo "Using kerberos for bucket prefix: ${KERBEROS}"
+else
+  KERBEROS=$(hostname -s | tr '[:upper:]' '[:lower:]' | tr -cd 'a-z0-9' | head -c 15)
+  echo "Using local hostname for bucket prefix: ${KERBEROS}"
+fi
+BUCKET_PREFIX="loki-${KERBEROS}"
+
+echo "Script logged in to cluster: ${CLUSTER_NAME}"
+echo "Bucket Prefix will be: ${BUCKET_PREFIX}-<random>"
+echo "--------------------------------"
+
+# --- 1. DYNAMIC PLATFORM & STORAGE CLASS DETECTION ---
+echo "--- Detecting OpenShift Infrastructure ---"
+PLATFORM_TYPE=$(oc get infrastructure cluster -o jsonpath='{.status.platformStatus.type}')
+
+# Dynamically fetch the default StorageClass from the cluster
+DEFAULT_SC=$(oc get sc -o jsonpath='{.items[?(@.metadata.annotations.storageclass\.kubernetes\.io/is-default-class=="true")].metadata.name}' 2>/dev/null | awk '{print $1}')
+
+if [ -n "$DEFAULT_SC" ]; then
+    echo "Detected default StorageClass: $DEFAULT_SC"
+else
+    echo "No default StorageClass found. Will use platform fallbacks."
+fi
+
+if [ "$PLATFORM_TYPE" = "AWS" ]; then
+    CLOUD_REGION=$(oc get infrastructure cluster -o jsonpath='{.status.platformStatus.aws.region}')
+    echo "Detected AWS platform in region: $CLOUD_REGION"
+    
+    AWS_ACCESS_KEY_ID=$(aws configure get aws_access_key_id || true)
+    AWS_SECRET_ACCESS_KEY=$(aws configure get aws_secret_access_key || true)
+    
+    if [ -z "$AWS_ACCESS_KEY_ID" ] || [ -z "$AWS_SECRET_ACCESS_KEY" ]; then
+        echo "ERROR: AWS credentials not found. Please ensure ~/.aws/credentials exists or run 'aws configure'." >&2
+        exit 1
+    fi
+    STORAGE_CLASS=${DEFAULT_SC:-"gp3-csi"}
+
+elif [ "$PLATFORM_TYPE" = "GCP" ]; then
+    CLOUD_REGION=$(oc get infrastructure cluster -o jsonpath='{.status.platformStatus.gcp.region}')
+    echo "Detected GCP platform in region: $CLOUD_REGION"
+    
+    GCP_CRED_FILE=$(ls "${HOME}/.gcp/"*.json 2>/dev/null | head -n 1 || true)
+    
+    if [ -z "$GCP_CRED_FILE" ] || [ ! -f "$GCP_CRED_FILE" ]; then
+        echo "ERROR: GCP credential (.json) file not found in ${HOME}/.gcp/." >&2
+        exit 1
+    fi
+    
+    echo "Using GCP credentials from: $GCP_CRED_FILE"
+    gcloud auth activate-service-account --key-file="$GCP_CRED_FILE" >/dev/null 2>&1
+    STORAGE_CLASS=${DEFAULT_SC:-"standard-csi"}
+else
+    echo "ERROR: Unsupported platform '$PLATFORM_TYPE'." >&2
+    exit 1
+fi
+
+echo "StorageClass selected for LokiStack: $STORAGE_CLASS"
+echo "--------------------------------"
+
+# --- 2. STORAGE BUCKET LOGIC (AWS & GCP) ---
+THRESHOLD_SECONDS=129600 # 1.5 days
+CURRENT_TIME=$(date +%s)
+CREATE_NEW_BUCKET=true
+BUCKET_NAME=""
+
+echo "--- Managing Storage Buckets ---"
+
+if [ "$PLATFORM_TYPE" = "AWS" ]; then
+    # Reliable parsing for AWS buckets
+    EXISTING_BUCKET=$(aws s3 ls 2>/dev/null | awk '{print $3}' | grep "^${BUCKET_PREFIX}-" | head -n 1 || true)
+    
+    if [ -n "$EXISTING_BUCKET" ]; then
+        echo "Found existing AWS bucket: $EXISTING_BUCKET"
+        
+        # 1st Check: Is the bucket empty?
+        IS_EMPTY=$(aws s3 ls "s3://${EXISTING_BUCKET}/" 2>/dev/null | head -n 1 || true)
+        if [ -z "$IS_EMPTY" ]; then
+            echo "  > Bucket is EMPTY. Reusing immediately."
+            BUCKET_NAME=$EXISTING_BUCKET
+            CREATE_NEW_BUCKET=false
+        else
+            # 2nd Check: Age of bucket
+            CREATION_DATE=$(aws s3api list-buckets --query "Buckets[?Name=='$EXISTING_BUCKET'].CreationDate" --output text 2>/dev/null || true)
+            if [ -n "$CREATION_DATE" ] && [ "$CREATION_DATE" != "None" ]; then
+                if date --version >/dev/null 2>&1; then
+                    CREATION_EPOCH=$(date -d "$CREATION_DATE" +%s 2>/dev/null || echo 0)
+                else
+                    CLEAN_DATE=$(echo "$CREATION_DATE" | sed 's/\..*//; s/Z//; s/+.*//')
+                    CREATION_EPOCH=$(date -j -f "%Y-%m-%dT%H:%M:%S" "$CLEAN_DATE" +%s 2>/dev/null || echo 0)
+                fi
+                
+                if [ "$CREATION_EPOCH" -ne 0 ]; then
+                    AGE_SECONDS=$(( CURRENT_TIME - CREATION_EPOCH ))
+                    AGE_HOURS=$(( AGE_SECONDS / 3600 ))
+                    echo "  > Bucket is NOT empty. Age: $AGE_HOURS hours."
+
+                    if [ "$AGE_SECONDS" -lt "$THRESHOLD_SECONDS" ]; then
+                        echo "  > Bucket is younger than 1.5 days. Reusing."
+                        BUCKET_NAME=$EXISTING_BUCKET
+                        CREATE_NEW_BUCKET=false
+                    else
+                        echo "  > Bucket is older than 1.5 days. Flagging for new creation."
+                    fi
+                fi
+            fi
+        fi
+    fi
+
+    if [ "$CREATE_NEW_BUCKET" = true ]; then
+        RANDOM_ID=$(openssl rand -hex 4)
+        BUCKET_NAME="${BUCKET_PREFIX}-${RANDOM_ID}"
+        echo "Creating NEW S3 bucket: ${BUCKET_NAME}"
+        
+        # Critical AWS Fix: us-east-1 crashes if LocationConstraint is passed
+        if [ "$CLOUD_REGION" = "us-east-1" ]; then
+            aws s3api create-bucket --bucket "${BUCKET_NAME}" --region "us-east-1" >/dev/null
+        else
+            aws s3api create-bucket --bucket "${BUCKET_NAME}" --region "${CLOUD_REGION}" --create-bucket-configuration LocationConstraint="${CLOUD_REGION}" >/dev/null
+        fi
+    fi
+
+elif [ "$PLATFORM_TYPE" = "GCP" ]; then
+    # Bulletproof parsing: splits on '/' to isolate the raw bucket name
+    EXISTING_BUCKET=$( (gcloud storage ls 2>/dev/null || gsutil ls 2>/dev/null) | awk -F/ '{print $3}' | grep "^${BUCKET_PREFIX}-" | head -n 1 || true )
+    
+    if [ -n "$EXISTING_BUCKET" ]; then
+        echo "Found existing GCP bucket: $EXISTING_BUCKET"
+        
+        # 1st Check: Is the bucket empty?
+        IS_EMPTY=$( (gcloud storage ls "gs://${EXISTING_BUCKET}/" 2>/dev/null || gsutil ls "gs://${EXISTING_BUCKET}/" 2>/dev/null) | head -n 1 || true )
+        if [ -z "$IS_EMPTY" ]; then
+            echo "  > Bucket is EMPTY. Reusing immediately."
+            BUCKET_NAME=$EXISTING_BUCKET
+            CREATE_NEW_BUCKET=false
+        else
+            # 2nd Check: Age of bucket
+            CREATION_DATE=$( (gcloud storage buckets describe "gs://${EXISTING_BUCKET}" --format="value(timeCreated)" 2>/dev/null || gsutil ls -L -b "gs://${EXISTING_BUCKET}" 2>/dev/null | grep "Time created:" | awk '{print $3}') || true )
+            
+            if [ -n "$CREATION_DATE" ] && [ "$CREATION_DATE" != "None" ]; then
+                if date --version >/dev/null 2>&1; then
+                    CREATION_EPOCH=$(date -d "$CREATION_DATE" +%s 2>/dev/null || echo 0)
+                else
+                    CLEAN_DATE=$(echo "$CREATION_DATE" | sed 's/\..*//; s/Z//; s/+.*//')
+                    CREATION_EPOCH=$(date -j -f "%Y-%m-%dT%H:%M:%S" "$CLEAN_DATE" +%s 2>/dev/null || echo 0)
+                fi
+                
+                if [ "$CREATION_EPOCH" -ne 0 ]; then
+                    AGE_SECONDS=$(( CURRENT_TIME - CREATION_EPOCH ))
+                    AGE_HOURS=$(( AGE_SECONDS / 3600 ))
+                    echo "  > Bucket is NOT empty. Age: $AGE_HOURS hours."
+                    
+                    if [ "$AGE_SECONDS" -lt "$THRESHOLD_SECONDS" ]; then
+                        echo "  > Bucket is younger than 1.5 days. Reusing."
+                        BUCKET_NAME=$EXISTING_BUCKET
+                        CREATE_NEW_BUCKET=false
+                    else
+                        echo "  > Bucket is older than 1.5 days. Flagging for new creation."
+                    fi
+                fi
+            fi
+        fi
+    fi
+
+    if [ "$CREATE_NEW_BUCKET" = true ]; then
+        RANDOM_ID=$(openssl rand -hex 4)
+        BUCKET_NAME="${BUCKET_PREFIX}-${RANDOM_ID}"
+        echo "Creating NEW GCS bucket: ${BUCKET_NAME}"
+        gcloud storage buckets create "gs://${BUCKET_NAME}" --location="${CLOUD_REGION}" >/dev/null 2>&1 || gsutil mb -l "${CLOUD_REGION}" "gs://${BUCKET_NAME}" >/dev/null
+    fi
+fi
+
+# --- 3. ADVANCED SELF-HEALING OPERATOR INSTALLATION ---
+get_latest_channel() {
+  local PACKAGE=$1
+  
+  # Fetch all channels, strip out pre-release channels (alpha, beta, candidate, edge), sort by version, pick highest
+  local CHANNEL=$(oc get packagemanifest "$PACKAGE" -n openshift-marketplace -o jsonpath='{range .status.channels[*]}{.name}{"\n"}{end}' 2>/dev/null | grep -Evi 'alpha|beta|candidate|edge' | sort -V | tail -n 1 || true)
+  
+  # Failsafe 1: If regex stripped everything, try default channel
+  if [ -z "$CHANNEL" ]; then
+    CHANNEL=$(oc get packagemanifest "$PACKAGE" -n openshift-marketplace -o jsonpath='{.status.defaultChannel}' 2>/dev/null || true)
+  fi
+  
+  # Failsafe 2: If default channel is literally 'alpha', hard override and force any non-alpha channel
+  if [ "$CHANNEL" = "alpha" ]; then
+      CHANNEL=$(oc get packagemanifest "$PACKAGE" -n openshift-marketplace -o jsonpath='{range .status.channels[*]}{.name}{"\n"}{end}' 2>/dev/null | grep -v 'alpha' | sort -V | tail -n 1 || true)
+  fi
+  
+  echo "$CHANNEL"
+}
+
+install_operator() {
+    local NAME=$1
+    local NS=$2
+    local CHANNEL=$3
+
+    echo "--- Preparing Installation: $NAME (Target Channel: $CHANNEL) ---"
+    oc create ns "$NS" --dry-run=client -o yaml | oc apply -f - >/dev/null 2>&1
+
+    # Check for Stuck Subscriptions and CSVs
+    local EXISTING_SUB=$(oc get sub "$NAME" -n "$NS" -o jsonpath='{.metadata.name}' 2>/dev/null || true)
+    
+    if [ -n "$EXISTING_SUB" ]; then
+        local EXISTING_CHANNEL=$(oc get sub "$NAME" -n "$NS" -o jsonpath='{.spec.channel}' 2>/dev/null || true)
+        local EXISTING_CSV=$(oc get sub "$NAME" -n "$NS" -o jsonpath='{.status.currentCSV}' 2>/dev/null || true)
+        
+        # Scenario A: User had it deployed on alpha/wrong channel from older runs
+        if [ "$EXISTING_CHANNEL" != "$CHANNEL" ]; then
+            echo "  > [FIX] Subscription on wrong channel ($EXISTING_CHANNEL). Forcing change to $CHANNEL..."
+            oc delete sub "$NAME" -n "$NS" >/dev/null 2>&1 || true
+            [ -n "$EXISTING_CSV" ] && oc delete csv "$EXISTING_CSV" -n "$NS" >/dev/null 2>&1 || true
+            
+        # Scenario B: ResolutionFailed (No CSV ever got generated)
+        elif [ -z "$EXISTING_CSV" ]; then
+            echo "  > [FIX] Subscription stuck in ResolutionFailed state. Cleaning up..."
+            oc delete sub "$NAME" -n "$NS" >/dev/null 2>&1 || true
+            
+        # Scenario C: CSV failed to spin up properly
+        else
+            local PHASE=$(oc get csv "$EXISTING_CSV" -n "$NS" -o jsonpath='{.status.phase}' 2>/dev/null || echo "Unknown")
+            if [ "$PHASE" = "Failed" ] || [ "$PHASE" = "Unknown" ] || [ "$PHASE" = "" ]; then
+                echo "  > [FIX] Operator CSV is stuck in $PHASE state. Deleting broken instances..."
+                oc delete csv "$EXISTING_CSV" -n "$NS" >/dev/null 2>&1 || true
+                oc delete sub "$NAME" -n "$NS" >/dev/null 2>&1 || true
+            elif [ "$PHASE" = "Succeeded" ]; then
+                echo "  > Operator is healthy and active. Skipping."
+                return 0
+            fi
+        fi
+    fi
+
+    if ! oc get operatorgroup -n "$NS" --no-headers 2>/dev/null | grep -q "."; then
+        cat <<EOF | oc apply -f - >/dev/null 2>&1
+apiVersion: operators.coreos.com/v1
+kind: OperatorGroup
+metadata:
+  name: ${NAME}-group
+  namespace: $NS
+spec:
+  upgradeStrategy: Default
+EOF
+    fi
+
+    cat <<EOF | oc apply -f - >/dev/null 2>&1
+apiVersion: operators.coreos.com/v1alpha1
+kind: Subscription
+metadata:
+  name: $NAME
+  namespace: $NS
+spec:
+  channel: $CHANNEL
+  installPlanApproval: Automatic
+  name: $NAME
+  source: redhat-operators
+  sourceNamespace: openshift-marketplace
+EOF
+
+    echo "  > Waiting for $NAME to spin up..."
+    for i in {1..60}; do
+        local CSV=$(oc get sub "$NAME" -n "$NS" -o jsonpath='{.status.currentCSV}' 2>/dev/null || true)
+        if [ -n "$CSV" ]; then
+            local CSV_PHASE=$(oc get csv "$CSV" -n "$NS" -o jsonpath='{.status.phase}' 2>/dev/null || true)
+            if [ "$CSV_PHASE" = "Succeeded" ]; then
+                echo "  > $NAME successfully deployed."
+                return 0
+            fi
+        fi
+        sleep 5
+    done
+    echo "ERROR: Timeout waiting for $NAME to reach Succeeded phase."
+    exit 1
+}
+
+LOKI_CH=$(get_latest_channel "loki-operator")
+COO_CH=$(get_latest_channel "cluster-observability-operator")
+LOG_CH=$(get_latest_channel "cluster-logging")
+
+install_operator "loki-operator" "openshift-operators-redhat" "$LOKI_CH"
+install_operator "cluster-observability-operator" "openshift-cluster-observability-operator" "$COO_CH"
+install_operator "cluster-logging" "openshift-logging" "$LOG_CH"
+
+# --- 4. CONFIGURE LOKI STORAGE SECRET ---
+echo "--- Configuring LokiStack Storage ---"
+if [ "$PLATFORM_TYPE" = "AWS" ]; then
+cat <<EOF | oc apply -f - >/dev/null 2>&1
+apiVersion: v1
+kind: Secret
+metadata:
+  name: logging-loki-storage
+  namespace: openshift-logging
+stringData:
+  access_key_id: ${AWS_ACCESS_KEY_ID}
+  access_key_secret: ${AWS_SECRET_ACCESS_KEY}
+  bucketnames: "${BUCKET_NAME}"
+  endpoint: https://s3.${CLOUD_REGION}.amazonaws.com
+  region: ${CLOUD_REGION}
+EOF
+STORAGE_SECRET_TYPE="s3"
+
+elif [ "$PLATFORM_TYPE" = "GCP" ]; then
+# UNIVERSAL CROSS-PLATFORM BASE64 COMMAND
+GCP_JSON_B64=$(cat "$GCP_CRED_FILE" | base64 | tr -d '\n')
+cat <<EOF | oc apply -f - >/dev/null 2>&1
+apiVersion: v1
+kind: Secret
+metadata:
+  name: logging-loki-storage
+  namespace: openshift-logging
+type: Opaque
+stringData:
+  bucketname: "${BUCKET_NAME}"
+data:
+  key.json: ${GCP_JSON_B64}
+EOF
+STORAGE_SECRET_TYPE="gcs"
+fi
+
+# --- 5. CREATE OR REPAIR LOKISTACK ---
+LOKI_DEGRADED=$(oc get lokistack logging-loki -n openshift-logging -o jsonpath='{.status.conditions[?(@.type=="Degraded")].status}' 2>/dev/null || echo "False")
+if [ "$LOKI_DEGRADED" = "True" ] || [ "$CREATE_NEW_BUCKET" = true ]; then
+    echo "  > [FIX] LokiStack is Degraded or Bucket changed. Removing old instance for a clean deploy..."
+    oc delete lokistack logging-loki -n openshift-logging >/dev/null 2>&1 || true
+    sleep 5
+fi
+
+cat <<EOF | oc apply -f - >/dev/null 2>&1
+apiVersion: loki.grafana.com/v1
+kind: LokiStack
+metadata:
+  name: logging-loki
+  namespace: openshift-logging
+spec:
+  size: 1x.demo
+  storage:
+    schemas:
+    - version: v13
+      effectiveDate: "2024-01-01"
+    secret:
+      name: logging-loki-storage
+      type: ${STORAGE_SECRET_TYPE}
+  storageClassName: ${STORAGE_CLASS}
+  tenants:
+    mode: openshift-logging
+EOF
+
+# --- 6. PERMISSIONS & FORWARDER ---
+echo "--- Configuring Permissions & Log Forwarding ---"
+oc create sa collector -n openshift-logging --dry-run=client -o yaml | oc apply -f - >/dev/null 2>&1
+for role in collect-application-logs collect-infrastructure-logs collect-audit-logs logging-collector-logs-writer; do
+    oc adm policy add-cluster-role-to-user $role -z collector -n openshift-logging >/dev/null 2>&1 || true
+done
+
+cat <<EOF | oc apply -f - >/dev/null 2>&1
+apiVersion: observability.openshift.io/v1alpha1
+kind: UIPlugin
+metadata:
+  name: logging
+spec:
+  type: Logging
+  logging:
+    lokiStack:
+      name: logging-loki
+---
+apiVersion: observability.openshift.io/v1
+kind: ClusterLogForwarder
+metadata:
+  name: collector
+  namespace: openshift-logging
+spec:
+  serviceAccount:
+    name: collector
+  outputs:
+  - name: default-lokistack
+    type: lokiStack
+    lokiStack:
+      target:
+        name: logging-loki
+        namespace: openshift-logging
+      authentication:
+        token:
+          from: serviceAccount
+    tls:
+      ca:
+        key: service-ca.crt
+        configMapName: openshift-service-ca.crt
+  pipelines:
+  - name: default-logstore
+    inputRefs:
+    - audit 
+    - application
+    - infrastructure
+    outputRefs:
+    - default-lokistack
+---
+apiVersion: logging.openshift.io/v1alpha1
+kind: LogFileMetricExporter
+metadata:
+  name: instance
+  namespace: openshift-logging
+spec:
+  nodeSelector: {}
+  resources:
+    limits:
+      cpu: 500m
+      memory: 256Mi
+    requests:
+      cpu: 200m
+      memory: 128Mi
+  tolerations: []
+EOF
+
+oc label namespace openshift-logging openshift.io/cluster-monitoring="true" --overwrite >/dev/null 2>&1
+echo "--------------------------------"
+echo "DONE! Logging stack initialized."
+echo "Platform: $PLATFORM_TYPE"
+echo "Active Storage Bucket: ${BUCKET_NAME}"
+echo "Active Storage Class: ${STORAGE_CLASS}"

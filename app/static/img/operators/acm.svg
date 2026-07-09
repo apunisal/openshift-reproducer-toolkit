@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 120 120" role="img" aria-label="Advanced Cluster Management">
+  <rect width="120" height="120" rx="8" fill="#fff"/>
+  <rect x="20" y="20" width="80" height="80" rx="6" fill="#1a1a1a"/>
+  <circle cx="42" cy="48" r="10" fill="#ee0000"/>
+  <circle cx="78" cy="48" r="10" fill="#ee0000"/>
+  <circle cx="60" cy="78" r="10" fill="#ee0000"/>
+  <path d="M50 48h16M48 54l8 16M72 54l-8 16" stroke="#fff" stroke-width="2" stroke-dasharray="3 3" fill="none"/>
+</svg>

@@ -1,0 +1,9 @@
+.venv/
+.server.pid
+.server.log
+__pycache__/
+*.pyc
+*.log
+acm-install-logs.txt
+openshift_setup_*.log
+failed_users_*.txt
