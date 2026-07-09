@@ -1,6 +1,0 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 120 120" role="img" aria-label="NVIDIA GPU Operator">
-  <rect width="120" height="120" rx="8" fill="#fff"/>
-  <path fill="#76b900" d="M38 78V42h8.5c8.2 0 13.8 5.4 13.8 13.2 0 7.5-5.4 12.8-13.4 12.8H38zm8.2-6.5h.3c4.8 0 7.8-3.2 7.8-8.5 0-5.4-3-8.7-7.9-8.7h-.2v17.2z"/>
-  <path fill="#76b900" d="M66 78V42h14.5c7.8 0 12.8 4 12.8 10.5 0 5.2-3.2 8.5-7.8 9.3l8.5 16.2H82l-7.5-14.8H74v14.8H66zm8-20.5h5.8c3.5 0 5.5-1.8 5.5-4.8 0-3-2-4.8-5.5-4.8H74v9.6z"/>
-  <text x="60" y="98" text-anchor="middle" font-family="Arial,sans-serif" font-size="11" font-weight="700" fill="#76b900">NVIDIA</text>
-</svg>
